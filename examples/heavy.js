@@ -25,32 +25,33 @@
 
   function heavyWork(iterations = 500_000, context = {}) {
     const { log, logs } = makeLogger("heavy");
-    const iter = iterations ?? context.iterations ?? 500_000;
-    let acc = 0;
-    const start = Date.now();
-    const re =
-      context.regex instanceof RegExp
-        ? context.regex
-        : /([A-Z]{2,4})(\d{3})/;
-    const template =
-      typeof context.template === "string"
-        ? context.template
-        : "ABCD123 XYZ789 HELLO456 WORLD000";
-    const arr = [];
-    const sourceBigObject =
-      context.bigObject && context.bigObject.users
-        ? context.bigObject
-        : defaultBigObject(context.userCount || 50);
-    let bigObject = {
-      ...sourceBigObject,
-      users: sourceBigObject.users.map((u) => ({
-        ...u,
-        prefs: { ...(u.prefs || {}), flags: { ...(u.prefs?.flags || {}) } },
-      })),
-    };
+    try {
+      const iter = iterations ?? context.iterations ?? 500_000;
+      let acc = 0;
+      const start = Date.now();
+      const re =
+        context.regex instanceof RegExp
+          ? context.regex
+          : /([A-Z]{2,4})(\d{3})/;
+      const template =
+        typeof context.template === "string"
+          ? context.template
+          : "ABCD123 XYZ789 HELLO456 WORLD000";
+      const arr = [];
+      const sourceBigObject =
+        context.bigObject && context.bigObject.users
+          ? context.bigObject
+          : defaultBigObject(context.userCount || 50);
+      let bigObject = {
+        ...sourceBigObject,
+        users: sourceBigObject.users.map((u) => ({
+          ...u,
+          prefs: { ...(u.prefs || {}), flags: { ...(u.prefs?.flags || {}) } },
+        })),
+      };
 
-    log(`heavy workload started (iterations=${iter.toLocaleString()})`);
-    for (let i = 0; i < iter; i += 1) {
+      log(`heavy workload started (iterations=${iter.toLocaleString()})`);
+      for (let i = 0; i < iter; i += 1) {
       // Math and bitwise
       acc += Math.imul(i, i % 97) ^ (i << 1);
       acc += Math.sin(i % 360) + Math.log1p((i % 1000) + 1);
@@ -84,10 +85,32 @@
       acc += totalScore % 1000;
     }
 
-    const durationMs = Date.now() - start;
-    log(`heavy workload finished in ${durationMs.toFixed(2)}ms (acc=${acc})`);
-    log(`heavy workload summary (logs=${logs.length}, duration_ms=${durationMs.toFixed(2)})`);
-    return { result: acc, logs };
+      const durationMs = Date.now() - start;
+      const finalUserCount = bigObject.users.length;
+      const finalTotalScore = bigObject.users.reduce((sum, u) => sum + u.score, 0);
+      log(`heavy workload finished in ${durationMs.toFixed(2)}ms (acc=${acc})`);
+      log(`heavy workload summary (logs=${logs.length}, duration_ms=${durationMs.toFixed(2)})`);
+      return {
+        result: acc,
+        logs,
+        verification: {
+          iterations: iter,
+          finalAccumulator: acc,
+          finalUserCount: finalUserCount,
+          finalTotalScore: finalTotalScore,
+          lastUpdated: bigObject.meta.lastUpdated,
+          completed: true,
+        },
+      };
+    } catch (error) {
+      const errorMsg = `heavy workload error: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      log(`error: ${errorMsg}${stackMsg}`);
+      if (typeof console !== "undefined" && console.error) {
+        console.error(`[heavy:error] ${errorMsg}${stackMsg}`);
+      }
+      throw error;
+    }
   }
 
   benchRunners.heavy = (context = {}, iterations) =>
@@ -98,6 +121,20 @@
     module.parent
   );
   if (shouldAutoRun) {
-    heavyWork();
+    try {
+      const result = heavyWork();
+      // Return the result so Python can verify it
+      if (typeof module !== "undefined" && module.exports) {
+        module.exports = result;
+      }
+      return result;
+    } catch (error) {
+      const errorMsg = `[heavy:error] Execution failed: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      if (typeof console !== "undefined") {
+        console.error(errorMsg + stackMsg);
+      }
+      throw error;
+    }
   }
 })();

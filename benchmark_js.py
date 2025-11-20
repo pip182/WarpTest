@@ -89,8 +89,10 @@ def _summarize_logs(
     return f"{body}{suffix}"
 
 
-def wrap_code_for_capture(code: str) -> str:
+def wrap_code_for_capture(code: str, print_result: bool = False) -> str:
     # Wrap user code to capture console output and the returned value as JSON.
+    # If print_result is True, print to original console (not the wrapped one) so it's not captured in logs
+    print_stmt = "if (__origConsole.log) __origConsole.log(__payload);" if print_result else ""
     return f"""
 (function() {{
   var __logs = [];
@@ -115,16 +117,28 @@ def wrap_code_for_capture(code: str) -> str:
   try {{
     __result = (function() {{ {code} }})();
   }} catch (e) {{
+    var errorMsg = String(e);
     var stack = (e && e.stack) ? " | stack: " + e.stack : "";
-    __logs.push("exception: " + e + stack);
+    var fullError = "exception: " + errorMsg + stack;
+    __logs.push(fullError);
+    // Also log to original console if available
+    if (__origConsole.error) {{
+      __origConsole.error(fullError);
+    }}
     throw e;
   }}
   var __payload;
   try {{
     __payload = JSON.stringify({{ result: __result, logs: __logs }});
   }} catch (jsonErr) {{
+    var jsonErrorMsg = "JSON serialization error: " + String(jsonErr);
+    __logs.push(jsonErrorMsg);
+    if (__origConsole.error) {{
+      __origConsole.error(jsonErrorMsg);
+    }}
     __payload = JSON.stringify({{ result: String(__result), logs: __logs, error: String(jsonErr) }});
   }}
+  {print_stmt}
   return __payload;
 }})();
 """.strip()
@@ -181,6 +195,37 @@ def load_code(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def bundle_peer_runners_if_needed(code: str, script_path: Path) -> str:
+    """If running context_with.js, bundle peer runner code for embedded engines that don't have require."""
+    if script_path.name != "context_with.js":
+        return code
+
+    # Check if peer runner functions are already defined in the code
+    # (they would be if already bundled or if running in node-cli/node-http)
+    has_heavy = "function heavyWork" in code
+    has_json_parse = "function jsonParseBench" in code
+    has_numeric_loop = "function numericLoop" in code
+
+    if has_heavy and has_json_parse and has_numeric_loop:
+        # Already has peer runners, no need to bundle
+        return code
+
+    # Need to bundle peer runners for embedded engines
+    examples_dir = script_path.parent
+    peer_files = ["heavy.js", "json_parse.js", "numeric_loop.js"]
+    bundled_code = code
+
+    for peer_file in peer_files:
+        peer_path = examples_dir / peer_file
+        if peer_path.exists():
+            peer_code = peer_path.read_text(encoding="utf-8")
+            # Prepend peer runner code - they'll register on globalThis.benchRunners
+            # when executed, making them available to context_with.js
+            bundled_code = peer_code + "\n" + bundled_code
+
+    return bundled_code
+
+
 def time_runs(runner: Callable[[], None], iterations: int) -> List[float]:
     durations: List[float] = []
     for _ in range(iterations):
@@ -200,40 +245,72 @@ def summarize_timings(timings: List[float]) -> str:
 
 def node_cli_runner(script_path: Path) -> Callable[[], None]:
     first = {"done": False}
+    # For context_with.js, we need to bundle peer runners since require won't work with node -e
+    code = load_code(script_path)
+    if script_path.name == "context_with.js":
+        # Bundle peer runners for node-cli too
+        code = bundle_peer_runners_if_needed(code, script_path)
+    # Use print_result=True so the JSON is printed to stdout for node-cli
+    wrapped_code = wrap_code_for_capture(code, print_result=True)
 
     def _run() -> None:
         try:
-            if not first["done"]:
-                proc = subprocess.run(
-                    ["node", str(script_path)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                out = (proc.stdout or "").strip()
-                err = (proc.stderr or "").strip()
-                if out:
+            # Use node -e to execute the wrapped code
+            proc = subprocess.run(
+                ["node", "-e", wrapped_code],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            out = (proc.stdout or "").strip()
+            err = (proc.stderr or "").strip()
+
+            # Parse the JSON payload from stdout
+            # The wrapped code returns JSON, which will be printed to stdout
+            # Console logs will also be in stdout, so we need to find the JSON line
+            payload = None
+            if out:
+                # Try to find JSON in the output (usually the last line)
+                lines = out.splitlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if line.startswith("{") and line.endswith("}"):
+                        try:
+                            payload = parse_payload(json.loads(line))
+                            break
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+
+                # If we couldn't parse JSON, log the output
+                if not payload and not first["done"]:
                     logger.info(
                         "node-cli stdout (%s):\n%s",
-                        f"{len(out.splitlines())} lines",
+                        f"{len(lines)} lines",
                         _summarize_text(out),
                     )
-                if err:
+
+            if err:
+                if not first["done"]:
                     logger.warning(
                         "node-cli stderr (%s):\n%s",
                         f"{len(err.splitlines())} lines",
                         _summarize_text(err),
                     )
-                first["done"] = True
-                return
 
-            subprocess.run(
-                ["node", str(script_path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            _run._last_payload = None  # type: ignore[attr-defined]
+            if payload:
+                _run._last_payload = payload  # type: ignore[attr-defined]
+                if not first["done"]:
+                    logs = payload.get("logs") or []
+                    logger.info(
+                        "node-cli result=%s logs=%s:\n%s",
+                        _format_result(payload.get("result")),
+                        len(logs),
+                        _summarize_logs(logs),
+                    )
+            else:
+                _run._last_payload = None  # type: ignore[attr-defined]
+
+            first["done"] = True
         except subprocess.CalledProcessError as exc:  # noqa: BLE001
             out = (exc.stdout or "").strip()
             err = (exc.stderr or "").strip()
@@ -249,6 +326,10 @@ def node_cli_runner(script_path: Path) -> Callable[[], None]:
                     f"{len(err.splitlines())} lines",
                     _summarize_text(err),
                 )
+            logger.error("node-cli failed with exit code %d", exc.returncode)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("node-cli unexpected error: %s", exc)
             raise
 
     return _run
@@ -263,6 +344,7 @@ class NodeServer:
     def start(self) -> None:
         env = os.environ.copy()
         env["PORT"] = str(self.port)
+        logger.debug("Starting Node server: %s on port %d", self.server_path, self.port)
         self.proc = subprocess.Popen(
             ["node", str(self.server_path)],
             stdout=subprocess.PIPE,
@@ -271,19 +353,35 @@ class NodeServer:
         )
         try:
             wait_until = time.time() + 5
+            check_count = 0
             while time.time() < wait_until:
                 if self.proc.poll() is not None:
                     try:
                         stdout, stderr = self.proc.communicate(timeout=1)
                     except Exception:  # noqa: BLE001
                         stdout, stderr = b"", b""
-                    message = stderr.decode().strip() or stdout.decode().strip()
+                    stdout_msg = stdout.decode("utf-8", errors="replace").strip()
+                    stderr_msg = stderr.decode("utf-8", errors="replace").strip()
+                    message = stderr_msg or stdout_msg or "No error message available"
+                    logger.error(
+                        "Node server process exited with code %d. stdout: %s, stderr: %s",
+                        self.proc.returncode,
+                        stdout_msg[:500],
+                        stderr_msg[:500],
+                    )
                     raise RuntimeError(
                         f"Node server failed to start (exit {self.proc.returncode}). {message}"
                     )
                 if self.healthy():
+                    logger.debug("Node server is healthy")
                     return
+                check_count += 1
+                if check_count % 10 == 0:
+                    # Log progress every second
+                    logger.debug("Waiting for Node server to become ready... (%.1fs)", time.time() - (wait_until - 5))
                 time.sleep(0.1)
+            # Server didn't become healthy, but process is still running
+            logger.error("Node server did not become healthy within timeout")
             raise RuntimeError("Timed out waiting for Node server to become ready.")
         except Exception:
             logger.exception("Node server failed to start.")
@@ -297,7 +395,16 @@ class NodeServer:
                 f"http://127.0.0.1:{self.port}/health", timeout=0.5
             ) as resp:
                 return resp.status == 200
-        except Exception:
+        except Exception as exc:
+            # Log the exception for debugging
+            if self.proc and self.proc.poll() is not None:
+                # Server has died, try to get error output
+                try:
+                    stdout, stderr = self.proc.communicate(timeout=0.1)
+                    if stderr:
+                        logger.debug("Node server stderr: %s", stderr.decode("utf-8", errors="replace")[:200])
+                except Exception:  # noqa: BLE001
+                    pass
             return False
 
     def stop(self) -> None:
@@ -318,12 +425,20 @@ class NodeServer:
 
 
 def node_server_runner(port: int, code: str) -> Callable[[], None]:
+    """
+    Create a runner that executes code via the Node HTTP server.
+
+    The server must already be started before this runner is called.
+    Only the HTTP request/response time is measured, not server startup.
+    """
     wrapped_code = wrap_code_for_capture(code)
     payload = json.dumps({"code": wrapped_code}).encode("utf-8")
     url = f"http://127.0.0.1:{port}/run"
     headers = {"Content-Type": "application/json"}
 
     def _run() -> None:
+        # Only measure the HTTP request/response time
+        # Server is already running, so no startup overhead
         req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -345,12 +460,17 @@ def node_server_runner(port: int, code: str) -> Callable[[], None]:
                     raise RuntimeError(f"Node server error: {parsed.get('error')}")
                 payload_parsed = parse_payload(parsed.get("result"))
                 _run._last_payload = payload_parsed  # type: ignore[attr-defined]
+                logs = payload_parsed.get("logs") or []
                 logger.info(
                     "node-http result=%s logs=%s:\n%s",
                     _format_result(payload_parsed.get("result")),
-                    len(payload_parsed.get("logs") or []),
-                    _summarize_logs(payload_parsed.get("logs")),
+                    len(logs),
+                    _summarize_logs(logs),
                 )
+                # Check for errors in logs
+                error_logs = [log for log in logs if (isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())) or (isinstance(log, dict) and log.get("level") in ("error", "warn"))]
+                if error_logs:
+                    logger.warning("node-http detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
         except Exception:
             logger.exception("node-http run failed")
             raise
@@ -374,15 +494,20 @@ def mini_racer_runner(code: str) -> Optional[Callable[[], None]]:
             payload = parse_payload(payload_raw)
             _run._last_payload = payload  # type: ignore[attr-defined]
             if not first["done"]:
+                logs = payload.get("logs") or []
                 logger.info(
                     "py-mini-racer result=%s logs=%s:\n%s",
                     _format_result(payload.get("result")),
-                    len(payload.get("logs") or []),
-                    _summarize_logs(payload.get("logs") or []),
+                    len(logs),
+                    _summarize_logs(logs),
                 )
+                # Check for errors in logs
+                error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                if error_logs:
+                    logger.warning("py-mini-racer detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                 first["done"] = True
-        except Exception:
-            logger.exception("py-mini-racer run failed")
+        except Exception as exc:
+            logger.exception("py-mini-racer run failed: %s", exc)
             raise
 
     return _run
@@ -407,17 +532,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -434,17 +564,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -460,17 +595,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -484,17 +624,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -508,17 +653,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -532,17 +682,22 @@ def jsrun_runner(code: str) -> Optional[Callable[[], None]]:
                     payload["runtime_stats"] = stats
                 _run._last_payload = payload  # type: ignore[attr-defined]
                 if not first["done"]:
+                    logs = payload.get("logs") or []
                     logger.info(
                         "jsrun result=%s logs=%s:\n%s",
                         _format_result(payload.get("result")),
-                        len(payload.get("logs") or []),
-                        _summarize_logs(payload.get("logs") or []),
+                        len(logs),
+                        _summarize_logs(logs),
                     )
+                    # Check for errors in logs
+                    error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                    if error_logs:
+                        logger.warning("jsrun detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                     if stats is not None:
                         logger.info("jsrun runtime stats: %s", _format_result(stats))
                     first["done"] = True
-            except Exception:
-                logger.exception("jsrun run failed")
+            except Exception as exc:
+                logger.exception("jsrun run failed: %s", exc)
                 raise
 
         runner = _run
@@ -563,15 +718,20 @@ def js2py_runner(code: str) -> Optional[Callable[[], None]]:
             payload = parse_payload(js2py.eval_js(wrapped))
             _run._last_payload = payload  # type: ignore[attr-defined]
             if not first["done"]:
+                logs = payload.get("logs") or []
                 logger.info(
                     "js2py result=%s logs=%s:\n%s",
                     _format_result(payload.get("result")),
-                    len(payload.get("logs") or []),
-                    _summarize_logs(payload.get("logs") or []),
+                    len(logs),
+                    _summarize_logs(logs),
                 )
+                # Check for errors in logs
+                error_logs = [log for log in logs if isinstance(log, str) and ("error" in log.lower() or "exception" in log.lower())]
+                if error_logs:
+                    logger.warning("js2py detected errors in logs: %s", _summarize_logs(error_logs, max_items=3))
                 first["done"] = True
-        except Exception:
-            logger.exception("js2py run failed")
+        except Exception as exc:
+            logger.exception("js2py run failed: %s", exc)
             raise
 
     return _run
@@ -580,34 +740,52 @@ def js2py_runner(code: str) -> Optional[Callable[[], None]]:
 def register_engines(
     script_path: Path, code: str, port: int, server_path: Path
 ) -> Tuple[List[Tuple[str, Callable[[], None]]], Optional[NodeServer]]:
+    """
+    Register all available engines and start the Node server if needed.
+
+    The Node server is started here (before benchmarks run) and must be stopped
+    by the caller after benchmarks complete. This ensures server start/stop times
+    are not included in performance measurements.
+    """
     engines: List[Tuple[str, Callable[[], None]]] = []
     node_server: Optional[NodeServer] = None
+
+    # Bundle peer runners for embedded engines (they don't have require)
+    bundled_code = bundle_peer_runners_if_needed(code, script_path)
 
     if shutil.which("node"):
         engines.append(("node-cli", node_cli_runner(script_path)))
         try:
+            # Start the server BEFORE creating runners to ensure it's ready
+            # Server start time is NOT included in benchmark timings
             node_server = NodeServer(server_path, port)
-            node_server.start()
-            engines.append(("node-http-server", node_server_runner(port, code)))
+            logger.debug("Starting Node server before benchmarks...")
+            node_server.start()  # This blocks until server is ready
+            logger.debug("Node server is ready")
+
+            # For context_with.js, bundle peer runners for node-http too since require might not work reliably
+            http_code = bundle_peer_runners_if_needed(code, script_path) if script_path.name == "context_with.js" else code
+            engines.append(("node-http-server", node_server_runner(port, http_code)))
         except Exception as exc:  # noqa: BLE001
             logger.warning("Skipping Node HTTP server: %s", exc)
             node_server = None
     else:
         logger.warning("Skipping Node engines: `node` executable not found.")
 
-    mr = mini_racer_runner(code)
+    # Use bundled code for embedded engines
+    mr = mini_racer_runner(bundled_code)
     if mr:
         engines.append(("py-mini-racer", mr))
     else:
         logger.info("Skipping py-mini-racer: module not installed.")
 
-    jr = jsrun_runner(code)
+    jr = jsrun_runner(bundled_code)
     if jr:
         engines.append(("jsrun", jr))
     else:
         logger.info("Skipping jsrun: module not installed or unsupported API.")
 
-    j2 = js2py_runner(code)
+    j2 = js2py_runner(bundled_code)
     if j2:
         engines.append(("js2py", j2))
     else:
@@ -631,7 +809,131 @@ def run_benchmarks(
     return results
 
 
-def print_report(results: List[EngineOutcome]) -> None:
+def verify_result(payload: Dict[str, object], script_name: str) -> Tuple[bool, List[str]]:
+    """Verify that the script completed correctly based on verification data."""
+    if not isinstance(payload, dict):
+        return False, ["Payload is not a dictionary"]
+
+    verification = payload.get("verification")
+    if not verification:
+        return True, []  # No verification data means we can't verify, but it's not an error
+
+    issues = []
+
+    if script_name == "numeric_loop.js":
+        if isinstance(verification, dict):
+            if not verification.get("completed", False):
+                issues.append("Script did not complete all iterations")
+            if verification.get("iterations") != verification.get("expectedIterations"):
+                issues.append(
+                    f"Iteration mismatch: {verification.get('iterations')} != {verification.get('expectedIterations')}"
+                )
+
+    elif script_name == "heavy.js":
+        if isinstance(verification, dict):
+            if not verification.get("completed", False):
+                issues.append("Script did not complete")
+            if verification.get("finalUserCount", 0) == 0:
+                issues.append("No users in final object")
+            if verification.get("lastUpdated") is None:
+                issues.append("lastUpdated not set in metadata")
+
+    elif script_name == "json_parse.js":
+        if isinstance(verification, dict):
+            if not verification.get("completed", False):
+                issues.append("Script did not complete")
+            if verification.get("finalUserCount", 0) == 0:
+                issues.append("No users in final parsed object")
+
+    elif script_name == "context_with.js":
+        if isinstance(verification, dict):
+            if not verification.get("completed", False):
+                issues.append("Script did not complete")
+            if verification.get("deepCount", 0) == 0:
+                issues.append("Deep counter is zero (may indicate incomplete execution)")
+            if verification.get("userCount", 0) == 0:
+                issues.append("No users in context")
+            if verification.get("inventoryCount", 0) == 0:
+                issues.append("No inventory items in context")
+
+    return len(issues) == 0, issues
+
+
+def check_completion(payload: Dict[str, object], script_name: str) -> Tuple[bool, List[str]]:
+    """Check if the script completed successfully based on logs and return value."""
+    if not isinstance(payload, dict):
+        return False, ["Payload is not a dictionary"]
+
+    issues = []
+    logs = payload.get("logs") or []
+    result_val = payload.get("result")
+
+    # Check for error/exception in logs
+    error_found = False
+    for log in logs:
+        if isinstance(log, str):
+            if "error:" in log.lower() or "exception:" in log.lower():
+                error_found = True
+                issues.append(f"Error in logs: {log[:100]}")
+        elif isinstance(log, dict) and log.get("level") in ("error", "warn"):
+            error_found = True
+            issues.append(f"Error in logs: {log.get('message', '')[:100]}")
+
+    # Check for completion indicators in logs based on script type
+    if script_name == "heavy.js":
+        has_start = any("heavy workload started" in str(log) for log in logs)
+        has_finish = any("heavy workload finished" in str(log) for log in logs)
+        if not has_start:
+            issues.append("Missing 'started' log entry")
+        if not has_finish:
+            issues.append("Missing 'finished' log entry - script may have been interrupted")
+        if has_start and not has_finish:
+            issues.append("Script started but did not finish - possible early termination")
+
+    elif script_name == "numeric_loop.js":
+        has_start = any("numeric loop started" in str(log) for log in logs)
+        has_finish = any("numeric loop finished" in str(log) for log in logs)
+        if not has_start:
+            issues.append("Missing 'started' log entry")
+        if not has_finish:
+            issues.append("Missing 'finished' log entry - script may have been interrupted")
+        if has_start and not has_finish:
+            issues.append("Script started but did not finish - possible early termination")
+
+    elif script_name == "json_parse.js":
+        has_start = any("json parse started" in str(log) for log in logs)
+        has_finish = any("json parse finished" in str(log) for log in logs)
+        if not has_start:
+            issues.append("Missing 'started' log entry")
+        if not has_finish:
+            issues.append("Missing 'finished' log entry - script may have been interrupted")
+        if has_start and not has_finish:
+            issues.append("Script started but did not finish - possible early termination")
+
+    elif script_name == "context_with.js":
+        has_start = any("Context script start" in str(log) for log in logs)
+        has_finish = any("Context script end" in str(log) for log in logs)
+        if not has_start:
+            issues.append("Missing 'start' log entry")
+        if not has_finish:
+            issues.append("Missing 'end' log entry - script may have been interrupted")
+        if has_start and not has_finish:
+            issues.append("Script started but did not finish - possible early termination")
+
+        # Check for peer runner completion
+        peer_logs_count = sum(1 for log in logs if any(peer in str(log) for peer in ["[heavy]", "[json_parse]", "[numeric_loop]"]))
+        if peer_logs_count < 6:  # Should have at least start/finish for each peer
+            issues.append(f"Expected more peer runner logs (found {peer_logs_count} entries)")
+
+    # Check if result is null when it shouldn't be
+    if result_val is None and logs:
+        # Result can be null if the script doesn't return anything, but we should check logs
+        pass  # This is okay for some scripts
+
+    return len(issues) == 0, issues
+
+
+def print_report(results: List[EngineOutcome], script_name: Optional[str] = None) -> None:
     print(f"\n{Colors.CYAN}=== Benchmark Results ==={Colors.RESET}")
     for outcome in results:
         if outcome.ok:
@@ -649,12 +951,57 @@ def print_report(results: List[EngineOutcome]) -> None:
         payload = outcome.payload or {}
         logs = payload.get("logs") if isinstance(payload, dict) else None
         result_val = payload.get("result") if isinstance(payload, dict) else None
+        verification = payload.get("verification") if isinstance(payload, dict) else None
+
         print(f"{Colors.GREEN}{headline}{Colors.RESET} result={_format_result(result_val)}")
+        if verification:
+            print(f"    verification: {_format_result(verification, max_len=200)}")
         if logs:
             preview = _summarize_logs(logs, indent="    ")
             print(f"    logs ({len(logs)}):\n{preview}")
         else:
             print("    logs: none")
+
+    # Completion verification section
+    if script_name:
+        print(f"\n{Colors.CYAN}=== Completion Verification ==={Colors.RESET}")
+        all_completed = True
+        for outcome in results:
+            if not outcome.ok:
+                print(f"{Colors.RED}{outcome.name:18}{Colors.RESET} ✗ failed to run")
+                all_completed = False
+                continue
+
+            payload = outcome.payload or {}
+            completed, issues = check_completion(payload, script_name)
+            if completed:
+                print(f"{Colors.GREEN}{outcome.name:18}{Colors.RESET} ✓ completed successfully")
+            elif issues:
+                all_completed = False
+                print(f"{Colors.YELLOW}{outcome.name:18}{Colors.RESET} ⚠ completion issues:")
+                for issue in issues:
+                    print(f"    - {issue}")
+            else:
+                print(f"{Colors.YELLOW}{outcome.name:18}{Colors.RESET} ? unable to verify completion")
+
+    # Verification section
+    if script_name:
+        print(f"\n{Colors.CYAN}=== Verification Results ==={Colors.RESET}")
+        all_verified = True
+        for outcome in results:
+            if not outcome.ok:
+                continue
+            payload = outcome.payload or {}
+            verified, issues = verify_result(payload, script_name)
+            if verified:
+                print(f"{Colors.GREEN}{outcome.name:18}{Colors.RESET} ✓ verified")
+            elif issues:
+                all_verified = False
+                print(f"{Colors.YELLOW}{outcome.name:18}{Colors.RESET} ⚠ verification issues:")
+                for issue in issues:
+                    print(f"    - {issue}")
+            else:
+                print(f"{Colors.YELLOW}{outcome.name:18}{Colors.RESET} ? no verification data")
 
     ok_results = [r for r in results if r.ok and r.timings]
     if ok_results:
@@ -742,15 +1089,23 @@ def main(argv: List[str]) -> int:
                 display_name = script
             logger.info("=== Running benchmarks for %s ===", display_name)
             code = load_code(script)
+            # Register engines and start server BEFORE benchmarks
+            # Server start time is NOT included in measurements
             engines, node_server = register_engines(
                 script, code, port=3210, server_path=repo_root / "node_server.js"
             )
             try:
+                # Run benchmarks - server is already running, so no startup overhead
                 results = run_benchmarks(engines, iterations=1)
-                print_report(results)
+                script_name = script.name if hasattr(script, "name") else str(script)
+                print_report(results, script_name=script_name)
             finally:
+                # Stop server AFTER benchmarks complete
+                # Server stop time is NOT included in measurements
                 if node_server:
+                    logger.debug("Stopping Node server after benchmarks...")
                     node_server.stop()
+                    logger.debug("Node server stopped")
         return 0
 
     args = parse_args(argv)
@@ -776,28 +1131,44 @@ def main(argv: List[str]) -> int:
                 logger.error("Failed to load script %s: %s", script, exc)
                 exit_code = 1
                 continue
+            # Register engines and start server BEFORE benchmarks
+            # Server start time is NOT included in measurements
             engines, node_server = register_engines(
                 script, code, args.port, args.server_path
             )
             try:
+                # Run benchmarks - server is already running, so no startup overhead
                 results = run_benchmarks(engines, args.iterations)
-                print_report(results)
+                script_name = script.name if hasattr(script, "name") else str(script)
+                print_report(results, script_name=script_name)
             finally:
+                # Stop server AFTER benchmarks complete
+                # Server stop time is NOT included in measurements
                 if node_server:
+                    logger.debug("Stopping Node server after benchmarks...")
                     node_server.stop()
+                    logger.debug("Node server stopped")
         return exit_code
     try:
         code = load_code(args.script)
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to load script: %s", exc)
         return 1
+    # Register engines and start server BEFORE benchmarks
+    # Server start time is NOT included in measurements
     engines, node_server = register_engines(args.script, code, args.port, args.server_path)
     try:
+        # Run benchmarks - server is already running, so no startup overhead
         results = run_benchmarks(engines, args.iterations)
-        print_report(results)
+        script_name = args.script.name if hasattr(args.script, "name") else str(args.script)
+        print_report(results, script_name=script_name)
     finally:
+        # Stop server AFTER benchmarks complete
+        # Server stop time is NOT included in measurements
         if node_server:
+            logger.debug("Stopping Node server after benchmarks...")
             node_server.stop()
+            logger.debug("Node server stopped")
     return 0
 
 

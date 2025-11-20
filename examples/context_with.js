@@ -83,69 +83,89 @@
 
   function runWith(iterations = 4_000) {
     const { log, logs } = makeLogger("context_with:runWith");
-    let acc = 0;
-    const start = Date.now();
-    log(`with-scope started (iterations=${iterations.toLocaleString()})`);
-    with (benchContext) {
-      for (let i = 0; i < iterations; i += 1) {
-        const u = users[i % users.length];
-        const item = inventory[i % inventory.length];
-        const history = u.stats.history[i % u.stats.history.length];
-        const featureOn = config.features.deep.level1.level2.level3.flag;
-        acc += u.stats.score + u.stats.visits + history.v;
-        acc += featureOn ? item.price : 0;
-        config.features.deep.level1.level2.level3.count += 1;
-        if (i % 50 === 0) {
-          inventory[i % inventory.length].price += i % 3;
+    try {
+      let acc = 0;
+      const start = Date.now();
+      log(`with-scope started (iterations=${iterations.toLocaleString()})`);
+      with (benchContext) {
+        for (let i = 0; i < iterations; i += 1) {
+          const u = users[i % users.length];
+          const item = inventory[i % inventory.length];
+          const history = u.stats.history[i % u.stats.history.length];
+          const featureOn = config.features.deep.level1.level2.level3.flag;
+          acc += u.stats.score + u.stats.visits + history.v;
+          acc += featureOn ? item.price : 0;
+          config.features.deep.level1.level2.level3.count += 1;
+          if (i % 50 === 0) {
+            inventory[i % inventory.length].price += i % 3;
+          }
         }
       }
+      const durationMs = Date.now() - start;
+      log(`with-scope finished in ${durationMs.toFixed(2)}ms (acc=${acc})`);
+      return { result: acc, logs };
+    } catch (error) {
+      const errorMsg = `runWith error: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      log(`error: ${errorMsg}${stackMsg}`);
+      if (typeof console !== "undefined" && console.error) {
+        console.error(`[context_with:runWith:error] ${errorMsg}${stackMsg}`);
+      }
+      throw error;
     }
-    const durationMs = Date.now() - start;
-    log(`with-scope finished in ${durationMs.toFixed(2)}ms (acc=${acc})`);
-    return { result: acc, logs };
   }
 
   // Heavier pass that combines deep lookups, array churn, and string work.
   function runHeavyWith(iterations = 15_000) {
     const { log, logs } = makeLogger("context_with:runHeavyWith");
-    let acc = 0;
-    const temp = [];
-    const start = Date.now();
-    log(`heavy with-scope started (iterations=${iterations.toLocaleString()})`);
-    with (benchContext) {
-      for (let i = 0; i < iterations; i += 1) {
-        const sec = largeDoc.sections[i % largeDoc.sections.length];
-        const row = sec.data[(i * 3) % sec.data.length];
-        const value = row.values[(i + row.values.length - 1) % row.values.length];
-        const user = users[(i * 5) % users.length];
-        const inv = inventory[(i * 7) % inventory.length];
-        const deepFlag = config.features.deep.level1.level2.level3.flag;
+    try {
+      let acc = 0;
+      const temp = [];
+      const start = Date.now();
+      log(`heavy with-scope started (iterations=${iterations.toLocaleString()})`);
+      with (benchContext) {
+        for (let i = 0; i < iterations; i += 1) {
+          const sec = largeDoc.sections[i % largeDoc.sections.length];
+          const row = sec.data[(i * 3) % sec.data.length];
+          const value = row.values[(i + row.values.length - 1) % row.values.length];
+          const user = users[(i * 5) % users.length];
+          const inv = inventory[(i * 7) % inventory.length];
+          const deepFlag = config.features.deep.level1.level2.level3.flag;
 
-        acc += value + row.checksum + (deepFlag ? 3 : 1);
-        acc += user.stats.score + inv.dims.w + inv.dims.h + inv.dims.d;
+          acc += value + row.checksum + (deepFlag ? 3 : 1);
+          acc += user.stats.score + inv.dims.w + inv.dims.h + inv.dims.d;
 
-        // Create and reuse some small objects to simulate user data churn.
-        const payload = {
-          id: `${sec.key}-${row.idx}-${i}`,
-          price: inv.price + (i % 5),
-          note: `${user.profile.name}-${row.path}-${i % 10}`,
-        };
-        temp.push(payload);
-        if (temp.length > 128) temp.shift();
-        acc += temp[(i + temp.length - 1) % temp.length].price % 17;
+          // Create and reuse some small objects to simulate user data churn.
+          const payload = {
+            id: `${sec.key}-${row.idx}-${i}`,
+            price: inv.price + (i % 5),
+            note: `${user.profile.name}-${row.path}-${i % 10}`,
+          };
+          temp.push(payload);
+          if (temp.length > 128) temp.shift();
+          acc += temp[(i + temp.length - 1) % temp.length].price % 17;
 
-        // Mutate nested counters to keep write pressure in the scope chain.
-        config.features.deep.level1.level2.level3.count += 2;
-        if (i % 40 === 0) {
-          inventory[(i * 11) % inventory.length].price = Math.max(0, inv.price - 1);
+          // Mutate nested counters to keep write pressure in the scope chain.
+          config.features.deep.level1.level2.level3.count += 2;
+          if (i % 40 === 0) {
+            inventory[(i * 11) % inventory.length].price = Math.max(0, inv.price - 1);
+          }
         }
       }
+      const durationMs = Date.now() - start;
+      log(
+        `heavy with-scope finished in ${durationMs.toFixed(2)}ms (acc=${acc}, logs=${logs.length})`
+      );
+      return { result: acc, logs };
+    } catch (error) {
+      const errorMsg = `runHeavyWith error: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      log(`error: ${errorMsg}${stackMsg}`);
+      if (typeof console !== "undefined" && console.error) {
+        console.error(`[context_with:runHeavyWith:error] ${errorMsg}${stackMsg}`);
+      }
+      throw error;
     }
-    const durationMs = Date.now() - start;
-    log(
-      `heavy with-scope finished in ${durationMs.toFixed(2)}ms (acc=${acc}, logs=${logs.length})`
-    );
-    return { result: acc, logs };
   }
 
   function loadPeerRunners() {
@@ -165,55 +185,84 @@
   }
 
   function runContextWith(options = {}) {
-    const {
-      context = null,
-      iterationsWith = 4_000,
-      iterationsHeavy = 15_000,
-      invokePeerRunners = true,
-      peerIterations = {},
-    } = options;
+    try {
+      const {
+        context = null,
+        iterationsWith = 4_000,
+        iterationsHeavy = 15_000,
+        invokePeerRunners = true,
+        peerIterations = {},
+      } = options;
 
-    const aggregateLogs = [];
-    const mergeLogs = (logs) => {
-      if (Array.isArray(logs)) aggregateLogs.push(...logs);
-    };
+      const aggregateLogs = [];
+      const mergeLogs = (logs) => {
+        if (Array.isArray(logs)) aggregateLogs.push(...logs);
+      };
 
-    if (context && typeof context === "object") {
-      globalThis.benchContext = context;
-    }
+      if (context && typeof context === "object") {
+        globalThis.benchContext = context;
+      }
 
-    const res1 = runWith(iterationsWith);
-    mergeLogs(res1?.logs);
-    const res2 = runHeavyWith(iterationsHeavy);
-    mergeLogs(res2?.logs);
+      const res1 = runWith(iterationsWith);
+      mergeLogs(res1?.logs);
+      const res2 = runHeavyWith(iterationsHeavy);
+      mergeLogs(res2?.logs);
 
-    if (invokePeerRunners) {
-      loadPeerRunners();
-      const peers = ["heavy", "jsonParse", "numericLoop"];
-      for (const name of peers) {
-        const runner = benchRunners[name];
-        if (typeof runner === "function") {
-          const peerResult = runner(benchContext, peerIterations[name]);
-          mergeLogs(peerResult?.logs);
+      if (invokePeerRunners) {
+        loadPeerRunners();
+        const peers = ["heavy", "jsonParse", "numericLoop"];
+        for (const name of peers) {
+          const runner = benchRunners[name];
+          if (typeof runner === "function") {
+            try {
+              const peerResult = runner(benchContext, peerIterations[name]);
+              mergeLogs(peerResult?.logs);
+            } catch (peerError) {
+              const errorMsg = `Peer runner ${name} failed: ${peerError}`;
+              const stackMsg = peerError.stack ? ` | stack: ${peerError.stack}` : "";
+              aggregateLogs.push(`error: ${errorMsg}${stackMsg}`);
+              if (typeof console !== "undefined" && console.error) {
+                console.error(`[context_with:error] ${errorMsg}${stackMsg}`);
+              }
+            }
+          }
         }
       }
+      const deepCount = benchContext.config.features.deep.level1.level2.level3.count;
+      mergeLogs([
+        `context_with_result=${deepCount}`,
+      ]);
+      if (typeof console !== "undefined" && console.log) {
+        console.log(
+          "Context summary:",
+          `with_runs=${iterationsWith.toLocaleString()}`,
+          `heavy_runs=${iterationsHeavy.toLocaleString()}`,
+          `peer_logs=${aggregateLogs.length}`,
+          `deep_count=${deepCount}`,
+        );
+      }
+      return {
+        result: deepCount,
+        logs: aggregateLogs,
+        verification: {
+          iterationsWith: iterationsWith,
+          iterationsHeavy: iterationsHeavy,
+          deepCount: deepCount,
+          userCount: benchContext.users.length,
+          inventoryCount: benchContext.inventory.length,
+          sectionsCount: benchContext.largeDoc.sections.length,
+          peerRunnersInvoked: invokePeerRunners,
+          completed: true,
+        },
+      };
+    } catch (error) {
+      const errorMsg = `runContextWith error: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      if (typeof console !== "undefined" && console.error) {
+        console.error(`[context_with:error] ${errorMsg}${stackMsg}`);
+      }
+      throw error;
     }
-    mergeLogs([
-      `context_with_result=${benchContext.config.features.deep.level1.level2.level3.count}`,
-    ]);
-    if (typeof console !== "undefined" && console.log) {
-      console.log(
-        "Context summary:",
-        `with_runs=${iterationsWith.toLocaleString()}`,
-        `heavy_runs=${iterationsHeavy.toLocaleString()}`,
-        `peer_logs=${aggregateLogs.length}`,
-        `deep_count=${benchContext.config.features.deep.level1.level2.level3.count}`,
-      );
-    }
-    return {
-      result: benchContext.config.features.deep.level1.level2.level3.count,
-      logs: aggregateLogs,
-    };
   }
 
   benchRunners.contextWith = runContextWith;
@@ -223,12 +272,26 @@
     module.parent
   );
   if (shouldAutoRun) {
-    if (typeof console !== "undefined" && console.log) {
-      console.log("Context script start (autoRun=true)");
-    }
-    runContextWith();
-    if (typeof console !== "undefined" && console.log) {
-      console.log("Context script end (autoRun=true)");
+    try {
+      if (typeof console !== "undefined" && console.log) {
+        console.log("Context script start (autoRun=true)");
+      }
+      const result = runContextWith();
+      if (typeof console !== "undefined" && console.log) {
+        console.log("Context script end (autoRun=true)");
+      }
+      // Return the result so Python can verify it
+      if (typeof module !== "undefined" && module.exports) {
+        module.exports = result;
+      }
+      return result;
+    } catch (error) {
+      const errorMsg = `[context_with:error] Execution failed: ${error}`;
+      const stackMsg = error.stack ? ` | stack: ${error.stack}` : "";
+      if (typeof console !== "undefined") {
+        console.error(errorMsg + stackMsg);
+      }
+      throw error;
     }
   }
 })();
